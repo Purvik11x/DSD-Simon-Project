@@ -17,6 +17,7 @@ module roundfunction #(parameter N=48,M=2)
  assign lr8 = {x1[N-9:0],x1[N-1:N-8]};
  
  //xi+2​=xi​⊕((S1(xi+1​)&S8(xi+1​))⊕S2(xi+1​)⊕ki​) Round function formula for second half
- assign y[2*N-1:N] = ((((lr1 & lr8)^x0)^lr2)^k);
+ assign y[2*N-1:N] = x0^(((lr1 & lr8)^lr2)^k);
   
+
 endmodule
