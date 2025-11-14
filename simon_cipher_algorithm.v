@@ -1,78 +1,111 @@
 `timescale 1ns/1ps
 
-module roundfunction #(parameter N=48, M=2)  
-(
-    input  [(2*N-1):0] x,
-    input  [(N-1):0]   k,
-    output [(2*N-1):0] y
-);
- 
-    wire [N-1:0] x0, x1, lr1, lr2, lr8;
- 
-    assign x0 = x[N-1:0];
-    assign x1 = x[2*N-1:N];
- 
-    // xi+1 = xi+1 Round function formula for first half
-    assign y[N-1:0] = x1;
- 
-    // Rotations
-    assign lr1 = {x1[N-2:0], x1[N-1]};
-    assign lr2 = {x1[N-3:0], x1[N-1:N-2]};
-    assign lr8 = {x1[N-9:0], x1[N-1:N-8]};
- 
-    // xi+2 = xi ⊕ ((S1(xi+1) & S8(xi+1)) ⊕ S2(xi+1) ⊕ ki)
-    assign y[2*N-1:N] = x0 ^ (((lr1 & lr8) ^ lr2) ^ k);
-  
-endmodule
-
-module keyscheduling #(parameter N=48, M=2)
-(
-    input  [(N*M-1):0] key,
-    input  [6:0]       i,
-    output reg [(N-1):0] key_i
+module simon_96_96 (
+    input               clk,
+    input               rst,
+    input               en,
+    input  [95:0]       plaintext,     // 2*n = 96
+    input  [95:0]       key,           // n*m = 48*2 = 96
+    output reg [95:0]   ciphertext,
+    output              done
 );
 
-    reg [N-1:0] temp, rot1, rot3;
-    reg [7:0] index;
+    // === SIMON 96/96 CONSTANTS ===
+    localparam N = 48;          // word size
+    localparam M = 2;           // key words
+    localparam ROUNDS = 52;     // rounds for SIMON-96/96
 
-    localparam [0:61] z_2 = 62'b10101111011100000011010010011000101000010001111110010110110011;
+    // === FSM STATES ===
+    localparam S_IDLE   = 2'b00;
+    localparam S_ENABLE = 2'b01;
+    localparam S_BUSY   = 2'b10;
+    localparam S_DONE   = 2'b11;
 
-    always @(*) begin
-        if (i < M)
-            key_i = key[(N*(i+1)-1) -: N];   
-        else begin
-            temp  = {key[2:0], key[N-1:3]}; 
-            rot3  = temp;
-            rot1  = {rot3[0], rot3[N-1:1]};  
-            index = (i-M) < 62 ? (i-M) : (i-M)-62;
-            key_i = ~key[N-1:0] ^ temp ^ z_2[index] ^ 2'b11;
-        end
-    end
+    reg [1:0]  state, next_state;
+    reg [7:0]  round_cnt, next_round_cnt;
 
-endmodule
+    reg  [95:0] x;          // current block state
+    wire [95:0] y;          // next state from round function
+    wire [47:0] key_i;      // generated key for this round
 
-module simon_cipher_algorithm #(parameter N=48, M=2)
-(
-    input  [(2*N-1):0] x,      // Input data block
-    input  [(N*M-1):0] key,    // Key input (concatenated keys)
-    input  [6:0]       round,  // Round index
-    output [(2*N-1):0] y       // Output block after round
-);
+    // key schedule memory
+    reg [47:0] key_schedule [0:ROUNDS-1];
 
-    wire [N-1:0] key_i;
-
-    // Instantiate key scheduling
-    keyscheduling #(N, M) u_keysched (
-        .key(key),
-        .i(round),
-        .key_i(key_i)
-    );
-
-    // Instantiate round function
-    roundfunction #(N, M) u_round (
+    // === Instantiate your modules ===
+    roundfunction #(N, M) RF (
         .x(x),
         .k(key_i),
         .y(y)
     );
 
+    // "key" or 2 previous subkeys fed based on round_cnt
+    wire [95:0] key_feed = (round_cnt < M) ?
+                            key :
+                            { key_schedule[round_cnt],
+                              key_schedule[round_cnt-1] };
+
+    keyscheduling #(N, M) KS (
+        .key(key_feed),
+        .i(round_cnt),
+        .key_i(key_i)
+    );
+
+    // === OUTPUT KEY selection ===
+    wire [47:0] k_selected =
+        (round_cnt < M) ?
+        key[(round_cnt+1)*N-1 -: N] :     // Extract initial words
+        key_schedule[round_cnt];          // Use computed subkeys
+
+    // === NEXT COUNTER ===
+    assign next_round_cnt =
+        (state == S_ENABLE) ? 0 :
+        (state == S_BUSY)   ? round_cnt + 1 :
+                              round_cnt;
+
+    // === NEXT STATE LOGIC ===
+    assign next_state =
+        rst               ? S_IDLE :
+        en                ? S_ENABLE :
+        (state == S_ENABLE) ? S_BUSY :
+        (state == S_BUSY && round_cnt < (ROUNDS-1)) ? S_BUSY :
+        (state == S_BUSY && round_cnt == (ROUNDS-1)) ? S_DONE :
+        (state == S_DONE) ? S_DONE :
+                            S_IDLE;
+
+    assign done = (state == S_DONE);
+
+    // === NEXT BLOCK STATE ===
+    wire [95:0] next_x =
+        (state == S_ENABLE) ? plaintext :
+        y;
+
+    // === NEXT CIPHERTEXT ===
+    wire [95:0] next_ciphertext =
+        (en == 1) ? 0 :
+        (state == S_BUSY && next_state == S_DONE) ? y :
+        ciphertext;
+
+    // === SEQUENTIAL BLOCK ===
+    always @(posedge clk) begin
+        if (rst) begin
+            state        <= S_IDLE;
+            round_cnt    <= 0;
+            x            <= 0;
+            ciphertext   <= 0;
+        end
+        else begin
+            state        <= next_state;
+            round_cnt    <= next_round_cnt;
+            x            <= next_x;
+            ciphertext   <= next_ciphertext;
+
+            // store generated keys
+            if (state == S_ENABLE)
+                key_schedule[0] <= key[47:0];
+            else if (state == S_BUSY)
+                key_schedule[next_round_cnt] <= key_i;
+        end
+    end
+
 endmodule
+
